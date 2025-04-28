@@ -1,16 +1,18 @@
-# stop_loss_fee_tool_v4.py – fee-centric SL/TP planner (bug‑fixed)
+# stop_loss_fee_tool_v5.py – fee-centric SL/TP planner (break‑even column)
 """
-Bug fix: **Shrink SL by round‑trip fees** now keeps the *original* position size and
-shrinks only the stop‑loss distance, so total risk (price move + fees) equals the
-chosen budget R.
-All other behaviour unchanged.
+New features
+────────────
+• **BE_dist** (break‑even distance) column added to raw data – the price move that
+  exactly offsets all fees for the given position size.
+• All numeric inputs are now plain text boxes (no +/- steppers) by omitting the
+  `step` parameter.  Target R:R switched from slider → number_input.
 """
 from __future__ import annotations
 import numpy as np, pandas as pd, plotly.graph_objects as go, streamlit as st
 
 EXEC_TYPES = ["% of notional (per leg)", "Flat $ per leg", "Spread (price units per leg)"]
 MAINT_TYPES = ["None", "% of notional per day", "Flat $ per day"]
-PTS = 200  # sweep resolution
+PTS = 200
 
 # ── Fee helpers ───────────────────────────────────────────────
 
@@ -18,7 +20,7 @@ def usd_exec_fee(q, p, t, v):
     if t.startswith("%"):
         return q * p * v / 100
     if t.startswith("Flat $"):
-        return v
+        return v           # per‑position flat cost; change to q*v if per‑lot
     if t.startswith("Spread"):
         return q * v
     return 0.0
@@ -43,7 +45,6 @@ def solve_size_exact(stp, p, R, et, ev, mt, mv, d):
     size = max((R - fixed) / coeff, 0.0) if coeff else 0.0
     return size, fixed
 
-
 def tp_needed(q, p, rr, R, et, ev, mt, mv, d):
     gross = rr * R + usd_exec_fee(q, p, et, ev) * 2 + usd_maint_fee(q, p, mt, mv, d)
     return gross / q if q else float('nan')
@@ -56,11 +57,12 @@ def app():
 
     with st.sidebar:
         sizing = st.radio("Sizing method", ("Include fees in sizing", "Shrink SL by round-trip fees", "Widen TP to absorb fees"))
-
         with st.expander("Risk", True):
-            acct = st.number_input("Account size", value=100.0, min_value=10.0, step=10.0)
-            rmode = st.radio("Mode", ("%", "$"))
-            R = acct * st.number_input("Risk %", value=1.0, step=0.1)/100 if rmode == "%" else st.number_input("Risk $", value=10.0, min_value=0.01)
+            acct = st.number_input("Account size", value=100.0, min_value=10.0)
+            if st.radio("Mode", ("%", "$")) == "%":
+                R = acct * st.number_input("Risk %", value=1.0) / 100
+            else:
+                R = st.number_input("Risk $", value=10.0, min_value=0.01)
         with st.expander("Fees", True):
             price = st.number_input("Current price", value=1.1000, format="%.5f")
             exec_t = st.selectbox("Exec type", EXEC_TYPES)
@@ -71,8 +73,8 @@ def app():
         with st.expander("Position", True):
             min_sl = st.number_input("Min SL", value=0.0001)
             max_sl = st.number_input("Max SL", value=0.0100)
-            rr = st.slider("Target R:R", 1.0, 10.0, 1.0, step=0.5)
-            fee_cap = st.slider("Fee cap %R", 5, 100, 20)
+            rr = st.number_input("Target R:R", value=1.0, min_value=0.1)
+            fee_cap = st.number_input("Fee cap %R", value=20.0, min_value=0.0)
             show_nofee = st.checkbox("Show no-fee TP", True)
 
     if not st.button("Generate"):
@@ -80,27 +82,25 @@ def app():
 
     rows = []
     for stp in np.linspace(min_sl, max_sl, PTS):
-        # -------- sizing modes --------
         if sizing.startswith("Include"):
             q, fixed = solve_size_exact(stp, price, R, exec_t, exec_v, maint_t, maint_v, days)
             eff_sl = stp
             tp = tp_needed(q, price, rr, R, exec_t, exec_v, maint_t, maint_v, days)
         elif sizing.startswith("Shrink"):
-            q = R / stp  # keep original size
-            if exec_t.startswith("Flat $"):
-                eff_sl = stp - 2 * exec_v / q
-            else:
-                eff_sl = stp - 2 * fee_price_units(exec_t, exec_v, price)
+            q = R / stp
+            eff_sl = stp - (2 * exec_v / q if exec_t.startswith("Flat $") else 2 * fee_price_units(exec_t, exec_v, price))
             if eff_sl <= 0:
                 continue
             tp = rr * stp
-        else:  # Widen TP
+        else:
             q = R / stp
             eff_sl = stp
             tp = tp_needed(q, price, rr, R, exec_t, exec_v, maint_t, maint_v, days)
 
-        total_fees = usd_exec_fee(q, price, exec_t, exec_v)*2 + usd_maint_fee(q, price, maint_t, maint_v, days)
-        rows.append(dict(SL=stp, Eff_SL=eff_sl, Size=q, Fees_pct=100*total_fees/R if R else 0, TP=tp))
+        variable_maint = 0.0 if maint_t.startswith("Flat $") else usd_maint_fee(q, price, maint_t, maint_v, days)
+        total_fees = usd_exec_fee(q, price, exec_t, exec_v) * 2 + variable_maint + (maint_v * days if maint_t.startswith("Flat $") else 0.0)
+        be_dist = total_fees / q if q else float('nan')
+        rows.append(dict(SL=stp, Eff_SL=eff_sl, Size=q, Fees_pct=100 * total_fees / R if R else 0, TP=tp, BE_dist=be_dist))
 
     if not rows:
         st.error("No valid points – widen SL or raise risk")
@@ -113,7 +113,7 @@ def app():
     fig.add_trace(go.Scatter(x=df.SL, y=df.Fees_pct, name="Fees %R", yaxis="y1"))
     fig.add_trace(go.Scatter(x=df.SL, y=df.TP, name="TP dist", yaxis="y2"))
     if show_nofee:
-        fig.add_trace(go.Scatter(x=df.SL, y=rr*df.SL, name="TP no-fee", yaxis="y2", line=dict(dash="dash")))
+        fig.add_trace(go.Scatter(x=df.SL, y=rr * df.SL, name="TP no-fee", yaxis="y2", line=dict(dash="dash")))
     fig.add_hrect(y0=fee_cap, y1=df.Fees_pct.max(), yref="y1", fillcolor="rgba(255,0,0,0.05)", line_width=0)
     if not np.isnan(min_ok):
         fig.add_vline(x=min_ok, line_dash="dot", line_color="red", annotation_text="min SL @ fee cap", annotation_position="top left")
